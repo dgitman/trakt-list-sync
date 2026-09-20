@@ -14,6 +14,14 @@ Before every batch, both lists are reread. The journal is persisted before sendi
 
 Trakt does not provide a compare-and-swap list mutation API. An edit in the gap between read and write can be indistinguishable from our operation. Removal and re-addition between hourly observations also cannot always be distinguished.
 
+## Deployment
+
+The Worker is deployed in the Personal Cloudflare account at
+`https://davemalie-sync.dgitman-personal.workers.dev`.
+The native email binding sends from `trakt-sync@gitman.net` to
+`david@because.ventures`. It is disabled until account authorization and baseline
+migration pass. The temporary Work-account deployment was removed.
+
 ## Validation
 
 Use Node 24+ (native TypeScript stripping) and Python 3 for provisioning:

@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "davemalie-sync",
+  "account_id": "d438b29f07b69b1768b27194151306df",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-20",
   "compatibility_flags": ["nodejs_compat"],
@@ -41,6 +42,6 @@
   ],
   "vars": {
     "ALERT_TO": "david@because.ventures",
-    "ALERT_FROM": "trakt-sync@because.ventures",
+    "ALERT_FROM": "trakt-sync@gitman.net",
   },
 }
