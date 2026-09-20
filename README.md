@@ -19,8 +19,12 @@ Trakt does not provide a compare-and-swap list mutation API. An edit in the gap 
 The Worker is deployed in the Personal Cloudflare account at
 `https://davemalie-sync.dgitman-personal.workers.dev`.
 The native email binding sends from `trakt-sync@gitman.net` to
-`david@because.ventures`. It is disabled until account authorization and baseline
-migration pass. The temporary Work-account deployment was removed.
+`david@because.ventures`. Both accounts are authorized and the sync is enabled. The existing baseline
+was migrated and a live server-side run succeeded on 2026-09-20 at 19:46 UTC,
+verifying one shared entry with no pending operations. Failure-email delivery
+was verified. The hourly cron is installed; its next scheduled run after
+enablement is 2026-09-20 at 20:17 UTC. A scheduled invocation has not yet been
+observed after enablement. The temporary Work-account deployment was removed.
 
 ## Validation
 
@@ -34,7 +38,8 @@ npm run typecheck
 npm run dry-run
 ```
 
-The tests use in-memory fixtures and a stub platform base class; they do not call live Trakt accounts. Deployment still requires live cloud verification.
+The tests use in-memory fixtures and a stub platform base class; they do not call live Trakt accounts. The deployed Worker also passed a live authorization, baseline, and sync check;
+the first run required no membership changes.
 
 ## Provisioning
 
