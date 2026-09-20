@@ -1,0 +1,46 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "davemalie-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SYNC",
+        "class_name": "DavEmalieSync",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DavEmalieSync"],
+    },
+  ],
+  "triggers": {
+    "crons": ["17 * * * *"],
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+  },
+  "secrets": {
+    "required": [
+      "ADMIN_KEY",
+      "ENCRYPTION_KEY",
+      "TRAKT_CLIENT_ID",
+      "TRAKT_CLIENT_SECRET",
+    ],
+  },
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "allowed_destination_addresses": ["david@because.ventures"],
+    },
+  ],
+  "vars": {
+    "ALERT_TO": "david@because.ventures",
+    "ALERT_FROM": "trakt-sync@because.ventures",
+  },
+}
