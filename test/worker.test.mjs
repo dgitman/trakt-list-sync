@@ -171,3 +171,33 @@ test("enable requires a tested notification path", async () => {
   await assert.rejects(f.obj.admin("/enable", {}), /notifications/);
   assert.equal(f.data.get("enabled"), undefined);
 });
+test('daily cron routes to history checking and repair',async()=>{
+ let checks=0,runs=0;const pending=[];
+ const env={SYNC:{getByName:()=>({historyCheck:async()=>{checks++},run:async()=>{runs++}})}};
+ await worker.scheduled({cron:'35 12 * * *'},env,{waitUntil:p=>pending.push(p)});
+ await worker.scheduled({cron:'17 * * * *'},env,{waitUntil:p=>pending.push(p)});
+ await Promise.all(pending);assert.equal(checks,1);assert.equal(runs,1);
+});
+test('history scan checks identities, reports issues, and deduplicates alerts',async()=>{
+ const f=fixture();let identities=0,calls=0;
+ f.obj.identity=async()=>{identities++};
+ f.obj.api=async(side,path,data)=>{assert.equal(data,undefined);calls++;return Response.json([{id:side==='david'?1:2,type:'movie',watched_at:'1970-01-01T00:00:00Z',movie:{title:'Example',released:'2020-01-01'}}],{headers:{'x-pagination-page-count':'1','x-pagination-item-count':'1'}})};
+ await f.obj.historyCheck();await f.obj.historyCheck();
+ assert.equal(identities,4);assert.equal(calls,4);assert.equal(f.emails,1);
+ assert.equal(f.data.get('history:lastRun').counts.david.issues,1);
+ assert.equal(f.data.has('state'),false);
+});
+test('failed history scan retains prior complete report',async()=>{
+ const f=fixture();f.data.set('history:summary:david',{scanned:99});
+ f.obj.identity=async()=>{};f.obj.api=async()=>{throw Error('Trakt unavailable')};
+ await assert.rejects(f.obj.historyCheck(),/Trakt unavailable/);
+ assert.deepEqual(f.data.get('history:summary:david'),{scanned:99});assert.equal(f.emails,1);
+});
+test('explicit rate-limit rejection retries without repeating an accepted write',async()=>{
+ const f=fixture(),original=globalThis.fetch;let calls=0;
+ globalThis.fetch=async()=>++calls===1?new Response('',{status:429,headers:{'Retry-After':'0'}}):Response.json({added:{movies:1}});
+ try {
+  const r=await f.obj.api('david','/sync/history',{movies:[]},{access_token:'test'});
+  assert.equal(r.status,200);assert.equal(calls,2);
+ } finally {globalThis.fetch=original;}
+});

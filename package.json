@@ -1,7 +1,7 @@
 {
   "name": "trakt-list-sync",
   "version": "1.0.0",
-  "description": "Hourly bidirectional Trakt personal-list sync hosted on Cloudflare Workers",
+  "description": "Hourly bidirectional Trakt list sync and daily watch-history date repairs on Cloudflare Workers",
   "scripts": {
     "test": "node --test test/*.test.ts test/*.test.mjs",
     "typecheck": "tsc --noEmit",

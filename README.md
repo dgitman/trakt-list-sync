@@ -1,12 +1,12 @@
 # Trakt list sync
 
-Hourly, bidirectional membership sync for the two private **DavEmalie** lists. The application runs entirely on Cloudflare Workers, using a SQLite Durable Object for encrypted OAuth credentials, the verified baseline, and the pending operation journal. No local scheduler, daemon, browser session, or running Mac is required.
+Hourly bidirectional sync of David and Emalie’s private **DavEmalie** lists, plus daily watch-history date checks and automatic repairs. Both jobs run on Cloudflare Workers and share encrypted OAuth credentials, sync state, and repair journals in the existing Durable Object.
 
-The local scripts are one-time deployment and administration tools, not the sync runtime.
+This is the canonical project, consolidating the original `trakt-list-sync` and `trakt-scrobble-check` code. Future fixes and deployments belong here.
 
-## Scope and conflict policy
+## Hourly list sync: scope and conflict policy
 
-Only list membership is changed. History, ratings, watchlists, other lists, ordering, notes, and privacy are untouched. Both account identities and pinned numeric list IDs are verified. Missing lists, incomplete pagination, unsupported media, and privacy changes fail closed.
+The hourly job changes only list membership. It leaves history, ratings, watchlists, other lists, ordering, notes, and privacy untouched. The separate daily job repairs eligible watch-history dates as described below. Both account identities and pinned numeric list IDs are verified. Missing lists, incomplete pagination, unsupported media, and privacy changes fail closed.
 
 Given the last verified common set B and current sets D and E, the target is `(D ∪ E) − ((B − D) ∪ (B − E))`. New additions propagate both ways; removal of previously synced entries wins. Movies, shows, seasons, and episodes use typed Trakt IDs.
 
@@ -14,53 +14,73 @@ Before every batch, both lists are reread. The journal is persisted before sendi
 
 Trakt does not provide a compare-and-swap list mutation API. An edit in the gap between read and write can be indistinguishable from our operation. Removal and re-addition between hourly observations also cannot always be distinguished.
 
-## Deployment
+## Daily history behavior
 
-The Worker is deployed in the Personal Cloudflare account at
-`https://davemalie-sync.dgitman-personal.workers.dev`.
-The native email binding sends from `trakt-sync@gitman.net` to
-`david@because.ventures`. Both accounts are authorized and the sync is enabled. The existing baseline
-was migrated and a live server-side run succeeded on 2026-09-20 at 19:46 UTC,
-verifying one shared entry with no pending operations. Failure-email delivery
-was verified. The hourly cron is installed; its next scheduled run after
-enablement is 2026-09-20 at 20:17 UTC. A scheduled invocation has not yet been
-observed after enablement. The temporary Work-account deployment was removed.
+- Checks complete paginated history for Unix-epoch placeholders and watches before a movie release or episode first-air timestamp.
+- Repairs eligible entries using release timestamps, including episode runtime. Preserves repeat watches using distinct minute offsets when needed.
+- Adds and verifies a replacement before removing the exact original history ID. A persistent cloud journal reconciles interrupted work without blindly repeating writes.
+- Verifies per-title watches, history counts, and ratings including rating timestamps. Unknown release dates, future releases, invalid timestamps, and ambiguous changes remain for review.
+- Processes up to 100 findings per account each run. Remaining findings are reported and checked on subsequent runs.
+- Emails completed repairs, new remaining findings, and failures. Identical unresolved findings are deduplicated.
+- Paces API calls and backs off on explicit rate-limit rejections.
 
-## Validation
+The daily trigger runs at **12:35 UTC** (08:35 Eastern during daylight saving time, 07:35 in winter). No local scheduler is required.
 
-Use Node 24+ (native TypeScript stripping) and Python 3 for provisioning:
+## Production deployment
+
+The Worker is `trakt-list-sync` in the Personal Cloudflare account:
+
+`https://trakt-list-sync.dgitman-personal.workers.dev`
+
+Set `SYNC_URL` to that URL for administration. The hourly list sync runs at minute 17; the daily history job runs at 12:35 UTC. Email is sent from `trakt-sync@gitman.net` to `david@because.ventures`.
+
+The existing Worker was renamed in place on October 5, 2026. Its secrets, Durable Object namespace, stored grants, baseline, repair journals, and both cron triggers were preserved. Retain the `DavEmalieSync` class, stable `davemalie` object name, encryption key, and migration configuration for future deployments. These names identify existing state and are independent of the project name.
+
+The September 20, 2026 deployment repaired its initial 46 date findings. That historical verification does not establish the current operational status; use the authenticated `status` and `history/report` operations to inspect recent runs.
+
+## Development
+
+Requires Node 24+ and npm. Provisioning also uses Python 3 and the 1Password CLI.
 
 ```sh
 npm ci
 npm test
-npm run types
 npm run typecheck
 npm run dry-run
 ```
 
-The tests use in-memory fixtures and a stub platform base class; they do not call live Trakt accounts. The deployed Worker also passed a live authorization, baseline, and sync check;
-the first run required no membership changes.
+The 31 tests cover detection, pagination integrity, interrupted additions and deletions, repeat-watch preservation, concurrent changes, account isolation, rate-limit recovery, notification behavior, and existing list-sync behavior. Tests do not call live Trakt accounts.
 
-## Provisioning
+## Deployment and secrets
 
-1. Authenticate Wrangler to the intended Cloudflare account. Prefer `npx wrangler login --device --use-keyring`.
-2. Configure `wrangler.jsonc` email sender to a domain enabled for Cloudflare Email Sending. The destination is restricted to `david@because.ventures`.
-3. Keep a random 32-byte base64 `ENCRYPTION_KEY` and a high-entropy `ADMIN_KEY` in 1Password. Never rotate the encryption key without migrating encrypted tokens.
-4. Set `ADMIN_KEY_REF`, `ENCRYPTION_KEY_REF`, `TRAKT_CLIENT_ID_REF`, and `TRAKT_CLIENT_SECRET_REF` to their `op://` references. Run `python3 scripts/provision-secrets.py` to stream values to Wrangler without secret files or command-line arguments.
-5. Run `npm run deploy`. The initial Durable Object is **disabled** even though the hourly cron is installed.
-6. Set `SYNC_URL` to the deployed Worker HTTPS URL and retain `ADMIN_KEY_REF` for administration. `npm run admin -- status` returns safe operational state.
-7. For each account, use `npm run admin -- auth/start '{"side":"david"}'` (then `emalie`), complete its device authorization in the correct account, then call `auth/poll` with the same body. Use dedicated grants, never copy desktop MCP refresh tokens.
-8. Call `snapshot`, resolve the old verified baseline to typed numeric Trakt IDs, and call `initialize '{"baseline":["movie:123"]}'` with the **actual** baseline, not this example. Initialization requires both live lists to match. If they changed since the saved baseline, reconcile the migration deliberately before continuing.
-9. Call `notifications/test` and verify the email arrived, then `dry-run`, `enable`, and `run`. Check `status` and both live lists. Verify a subsequent cloud cron run.
+```sh
+npm run deploy
+```
 
-Cloudflare cron is `17 * * * *` (UTC). Routine successful runs send no email. Failed runs email the configured destination, deduplicated for 24 hours for an identical error; a successful run resets deduplication. If sending fails, the next failed sync retries it. Both errors are recorded in Cloudflare logs.
+Authenticate Wrangler to the configured Cloudflare account first. The checked-in configuration points to the existing production Worker. Review its account, email destination, and schedules before deployment elsewhere.
 
-All administration requires a Bearer key over HTTPS. Valid operations are `status`, `snapshot`, `initialize`, `dry-run`, `enable`, `disable`, `run`, `auth/start`, `auth/poll`, and `notifications/test`. Tokens are never returned. Authorization headers must never be pasted into issue reports or logs.
+Required cloud secrets: `ADMIN_KEY`, `ENCRYPTION_KEY`, `TRAKT_CLIENT_ID`, and `TRAKT_CLIENT_SECRET`. The encryption key must be a random 32-byte base64 value. Existing secrets and encrypted OAuth grants must be retained for production updates.
+
+`scripts/provision-secrets.py` reads `ADMIN_KEY_REF`, `ENCRYPTION_KEY_REF`, `TRAKT_CLIENT_ID_REF`, and `TRAKT_CLIENT_SECRET_REF` from environment variables containing 1Password secret references. It streams values to Wrangler without saving or printing them. Never commit credentials, local operational configuration, OAuth token files, or personal history exports.
+
+## Administration
+
+Set `SYNC_URL` to the deployed Worker HTTPS URL and `ADMIN_KEY_REF` to its 1Password admin-key reference. All operations require the admin key. The client reads it directly through the 1Password CLI.
+
+```sh
+npm run admin -- status
+npm run admin -- history/check
+npm run admin -- history/report
+```
+
+`history/check` performs checks and repairs immediately. `history/report` returns the last complete findings, latest run status, and any pending repair journals. Completed repairs are also retained in Durable Object audit records.
+
+Other operations retained for the hourly list sync: `snapshot`, `initialize`, `dry-run`, `enable`, `disable`, `run`, `auth/start`, `auth/poll`, and `notifications/test`. `enable` and `disable` apply to list sync, not the daily history job. To suspend daily repairs, remove only its daily cron trigger.
+
+For a new deployment, authorize each account separately through `auth/start` and `auth/poll` with `{"side":"david"}` or `{"side":"emalie"}`. The Worker validates the expected identity before accepting a grant. Use independent cloud grants; do not reuse desktop MCP refresh tokens. Do not reauthorize an already working production deployment just to update its code.
 
 ## Recovery
 
-`disable` prevents further scheduled syncs without deleting state. It waits behind an in-progress run. Inspect `status` and `snapshot`; preserve the pending journal until the conflict is understood. Do not replace the baseline with a union after a partial failure, since that can resurrect intentional removals.
+An interrupted repair retains its journal. The next run reconciles actual history before changing it again. If an addition is ambiguous, the job stops and alerts rather than risking a duplicate or deleting the original. Inspect `history/report` before intervention. Missing release metadata is reported, not guessed. Release-date repairs are fallback dates, not recovered viewing dates.
 
-If a refresh request was interrupted after Trakt might have rotated its token, the worker requires a fresh authorization for that account. It does not blindly reuse an uncertain refresh token. The other account and list state remain intact.
-
-Deploying a new code version preserves Durable Object storage. Never delete the object or change its stable `davemalie` name to recover from a failure.
+The hourly list sync retains its baseline and pending operations independently. Never delete or reset the Durable Object to recover from an error.

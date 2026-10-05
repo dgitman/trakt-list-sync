@@ -1,3 +1,6 @@
+import { repairHistory, type Finding, type Repair } from "./history-repair.ts";
+import type { HistoryRow } from "./history.ts";
+import { scanHistory } from "./history.ts";
 import { timingSafeEqual } from "node:crypto";
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -106,7 +109,7 @@ export class DavEmalieSync extends DurableObject<Env> {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "User-Agent": "DavEmalie-Sync/1.0",
+        "User-Agent": "trakt-list-sync/1.0",
       },
       body: JSON.stringify({
         ...data,
@@ -118,8 +121,15 @@ export class DavEmalieSync extends DurableObject<Env> {
     if (!r.ok) throw Error("Trakt authorization HTTP " + r.status);
     return r.json();
   }
+  private lastApiRequest = 0;
+  private lastApiWrite = 0;
   private async api(side: Side, path: string, data?: object, override?: Token) {
     const t = override ?? (await this.token(side));
+    for(let attempt=0;attempt<5;attempt++) {
+    const delay = Math.max(0, 300 - (Date.now()-this.lastApiRequest), data ? 1100 - (Date.now()-this.lastApiWrite) : 0);
+    if(delay) await new Promise(resolve=>setTimeout(resolve,delay));
+    this.lastApiRequest=Date.now();
+    if(data) this.lastApiWrite=Date.now();
     const r = await fetch("https://api.trakt.tv" + path, {
       method: data ? "POST" : "GET",
       headers: {
@@ -127,13 +137,23 @@ export class DavEmalieSync extends DurableObject<Env> {
         "trakt-api-key": this.env.TRAKT_CLIENT_ID,
         "trakt-api-version": "2",
         "Content-Type": "application/json",
-        "User-Agent": "DavEmalie-Sync/1.0",
+        "User-Agent": "trakt-list-sync/1.0",
       },
       body: data ? JSON.stringify(data) : undefined,
       signal: AbortSignal.timeout(20000),
     });
+    if(r.status===429 && attempt<4) {
+      const header=r.headers.get('Retry-After');
+      const numeric=Number(header);
+      const seconds=header && Number.isFinite(numeric)?numeric:header?Math.max(0,(Date.parse(header)-Date.now())/1000):30;
+      await r.body?.cancel();
+      await new Promise(resolve=>setTimeout(resolve,Math.min(120,Math.max(5,Number.isFinite(seconds)?seconds:30))*1000));
+      continue;
+    }
     if (!r.ok) throw Error("Trakt HTTP " + r.status + " for " + side);
     return r;
+    }
+    throw Error("Trakt rate limit persisted");
   }
   private async identity(side: Side, t?: Token) {
     const user = (await (
@@ -298,12 +318,121 @@ export class DavEmalieSync extends DurableObject<Env> {
           error,
         });
         console.error(
-          JSON.stringify({ event: "davemalie_sync_failed", error }),
+          JSON.stringify({ event: "trakt_list_sync_failed", error }),
         );
         try {
           await this.notify(error);
         } catch {
-          console.error(JSON.stringify({ event: "davemalie_alert_failed" }));
+          console.error(JSON.stringify({ event: "trakt_list_sync_alert_failed" }));
+        }
+        throw Error(error);
+      }
+    });
+  }
+  private async repairOne(side: Side, finding: Finding, pending?: Repair) {
+    return repairHistory(finding, {
+      read: async f => {
+        const rows: HistoryRow[] = [];
+        let pages=1, count: number | undefined;
+        const end=encodeURIComponent(new Date().toISOString());
+        for(let page=1;page<=pages;page++) {
+          const r=await this.api(side,`/sync/history/${f.type}s/${f.mediaId}?extended=full&limit=250&page=${page}&end_at=${end}`);
+          const pc=r.headers.get("x-pagination-page-count"), ic=r.headers.get("x-pagination-item-count");
+          if(pc===null || ic===null) throw Error("Missing title history pagination");
+          const n=Number(ic), p=Math.max(1,Number(pc));
+          if(!Number.isInteger(n) || n<0 || !Number.isInteger(p) || p>50 || (count!==undefined && (n!==count || p!==pages))) throw Error("Title history changed during read");
+          count=n; pages=p;
+          const batch=await r.json() as HistoryRow[];
+          if(!Array.isArray(batch)) throw Error("Invalid title history");
+          rows.push(...batch);
+        }
+        if(rows.length!==count || new Set(rows.map(x=>x.id)).size!==count || rows.some(x=>x.type!==f.type || (x.type==='movie'?x.movie:x.episode)?.ids?.trakt!==f.mediaId)) throw Error("Incomplete or mismatched title history");
+        return rows;
+      },
+      post: async (path,body) => {
+        await this.identity(side);
+        return (await this.api(side,path,body)).json();
+      },
+      save: job => this.ctx.storage.put("history:pending:"+side,job),
+      complete: async job => {
+        await this.ctx.storage.put(`history:repair:${side}:${job.finding.id}`,{...job,completedAt:new Date().toISOString()});
+        await this.ctx.storage.delete("history:pending:"+side);
+      },
+    },pending);
+  }
+  private async ratingsFingerprint(side: Side) {
+    const rows: unknown[]=[];
+    let pages=1, count: number|undefined;
+    for(let page=1;page<=pages;page++) {
+      const r=await this.api(side,`/sync/ratings?limit=250&page=${page}`);
+      const pc=r.headers.get("x-pagination-page-count"),ic=r.headers.get("x-pagination-item-count");
+      if(pc===null || ic===null) throw Error("Missing ratings pagination");
+      const n=Number(ic),p=Math.max(1,Number(pc));
+      if(!Number.isInteger(n)||n<0||!Number.isInteger(p)||p>100||(count!==undefined&&(count!==n||pages!==p))) throw Error("Ratings changed during read");
+      count=n;pages=p;
+      const batch=await r.json() as Array<{type:string;rating:number;rated_at:string;[key:string]:unknown}>;
+      for(const x of batch) rows.push([x.type,(x[x.type] as {ids:{trakt:number}})?.ids?.trakt,x.rating,x.rated_at]);
+    }
+    if(rows.length!==count) throw Error("Incomplete ratings snapshot");
+    return JSON.stringify(rows.sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b))));
+  }
+  async historyCheck() {
+    return this.serialized(async () => {
+      const at = new Date().toISOString();
+      try {
+        const results: Record<string, Awaited<ReturnType<typeof scanHistory>>> = {};
+        const fixed: Record<string,number> = {david:0,emalie:0};
+        // Validate both identities before any history write.
+        for(const side of sides) await this.identity(side);
+        for (const side of sides) {
+          const pending=await this.ctx.storage.get<Repair>("history:pending:"+side);
+          let beforeRatings: string | undefined;
+          if(pending) {
+            beforeRatings=await this.ratingsFingerprint(side);
+            if((await this.repairOne(side,pending.finding,pending)).status==='fixed') fixed[side]++;
+          }
+          results[side] = await scanHistory(path => this.api(side, path), new Date().toISOString());
+          const initialCount=results[side].scanned;
+          for(const finding of results[side].issues.slice(0,100)) {
+            if(!['placeholder','before_release'].includes(finding.reason) || !finding.mediaId || !finding.release || Date.parse(finding.release)>Date.now()) continue;
+            beforeRatings ??= await this.ratingsFingerprint(side);
+            if((await this.repairOne(side,finding)).status==='fixed') fixed[side]++;
+          }
+          if(fixed[side]) {
+            results[side]=await scanHistory(path=>this.api(side,path),new Date().toISOString());
+            if(results[side].scanned!==initialCount) throw Error('History count changed during repair: '+side);
+          }
+          if(beforeRatings!==undefined && beforeRatings!==await this.ratingsFingerprint(side)) throw Error('Ratings changed during repair: '+side);
+        }
+        // Persist each account independently to avoid the storage value size limit.
+        for (const side of sides) {
+          const { issues, ...summary } = results[side];
+          await this.ctx.storage.put("history:summary:" + side, summary);
+          const chunks = Math.ceil(issues.length / 100);
+          for(let i=0;i<chunks;i++) await this.ctx.storage.put(`history:issues:${side}:${i}`, issues.slice(i*100,(i+1)*100));
+          await this.ctx.storage.put("history:chunks:" + side, chunks);
+        }
+        const signature = JSON.stringify(sides.map(side => results[side].issues.map(x => [x.id,x.reason,x.release]).sort((a,b)=>String(a).localeCompare(String(b)))));
+        const digest = encode(new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(signature))));
+        const total = sides.reduce((n,side)=>n+results[side].issues.length,0);
+        if((total && await this.ctx.storage.get("history:notified") !== digest) || sides.some(side=>fixed[side]>0)) {
+          await this.env.EMAIL.send({from:this.env.ALERT_FROM,to:this.env.ALERT_TO,
+            subject:total?"Trakt history repair: remaining issues":"Trakt history dates repaired",
+            text:sides.map(side => `${side}: ${results[side].scanned} watches checked; ${fixed[side]} repaired; ${results[side].issues.length} remaining date issues.\n`+
+              results[side].issues.slice(0,30).map(x=>`${x.title}: ${x.reason}; watched ${x.watched_at}; release ${x.release ?? "unknown"}`).join("\n")).join("\n\n")+
+              "\n\nEligible placeholder and before-release dates were replaced with release dates, preserving repeat watches and ratings. Full details are available through the authenticated history/report operation."});
+          await this.ctx.storage.put("history:notified",digest);
+        }
+        if(!total) await this.ctx.storage.delete("history:notified");
+        await this.ctx.storage.put("history:lastRun",{at,status:"success",counts:Object.fromEntries(sides.map(side=>[side,{scanned:results[side].scanned,issues:results[side].issues.length,fixed:fixed[side],unknownRelease:results[side].unknownRelease}]))});
+        await this.ctx.storage.delete("history:lastError");
+        return await this.ctx.storage.get("history:lastRun");
+      } catch(e) {
+        const error=e instanceof Error?e.message:"History scan failed";
+        await this.ctx.storage.put("history:lastRun",{at,status:"failed",error});
+        if(await this.ctx.storage.get("history:lastError")!==error) {
+          await this.env.EMAIL.send({from:this.env.ALERT_FROM,to:this.env.ALERT_TO,subject:"Trakt daily history check failed",text:error+"\nThe repair journal was retained. Some repairs may have completed; interrupted work will be reconciled before any further changes."});
+          await this.ctx.storage.put("history:lastError",error);
         }
         throw Error(error);
       }
@@ -393,6 +522,16 @@ export class DavEmalieSync extends DurableObject<Env> {
         );
         return { sent: true, result };
       }
+      if (path === "/history/report") {
+        const results: Record<string, unknown> = {};
+        for(const side of sides) {
+          const count = (await this.ctx.storage.get<number>("history:chunks:"+side)) ?? 0;
+          const issues: unknown[] = [];
+          for(let i=0;i<count;i++) issues.push(...((await this.ctx.storage.get<unknown[]>(`history:issues:${side}:${i}`)) ?? []));
+          results[side] = {summary:await this.ctx.storage.get("history:summary:"+side),issues};
+        }
+        return {lastRun:await this.ctx.storage.get("history:lastRun"),pending:{david:await this.ctx.storage.get("history:pending:david"),emalie:await this.ctx.storage.get("history:pending:emalie")},results};
+      }
       if (path === "/snapshot") return this.read();
       if (path === "/dry-run") return this.runInner(true);
       if (path === "/enable") {
@@ -412,6 +551,7 @@ export class DavEmalieSync extends DurableObject<Env> {
         return {
           enabled: (await this.ctx.storage.get("enabled")) ?? false,
           lastRun: await this.ctx.storage.get("lastRun"),
+          historyLastRun: await this.ctx.storage.get("history:lastRun"),
           state: await this.ctx.storage.get("state"),
           authorized: {
             david: !!(await this.ctx.storage.get("token:david")),
@@ -428,7 +568,7 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ) {
-    ctx.waitUntil(env.SYNC.getByName("davemalie").run());
+    ctx.waitUntil(_controller.cron === "35 12 * * *" ? env.SYNC.getByName("davemalie").historyCheck() : env.SYNC.getByName("davemalie").run());
   },
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method !== "POST")
@@ -470,7 +610,7 @@ export default {
       const path = new URL(request.url).pathname;
       const object = env.SYNC.getByName("davemalie");
       return Response.json(
-        path === "/run" ? await object.run() : await object.admin(path, body),
+        path === "/history/check" ? await object.historyCheck() : path === "/run" ? await object.run() : await object.admin(path, body),
         { headers: { "Cache-Control": "no-store" } },
       );
     } catch (e) {

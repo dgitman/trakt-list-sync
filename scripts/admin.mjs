@@ -12,6 +12,8 @@ const key = execFileSync("op", ["read", process.env.ADMIN_KEY_REF], {
 }).trim();
 const allowed = [
   "status",
+  "history/check",
+  "history/report",
   "snapshot",
   "initialize",
   "dry-run",
@@ -31,7 +33,7 @@ const response = await fetch(new URL("/" + path, base), {
     "Content-Type": "application/json",
   },
   body: json,
-  signal: AbortSignal.timeout(180000),
+  signal: AbortSignal.timeout(840000),
 });
 console.log(await response.text());
 if (!response.ok) process.exitCode = 1;

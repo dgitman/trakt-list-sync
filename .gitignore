@@ -1,7 +1,12 @@
 node_modules/
 .wrangler/
+dist/
 .dev.vars*
 .env*
-work/
 .ops.json
+work/
+*-report.json
+*-findings.csv
+*auth_token*
 .DS_Store
+
