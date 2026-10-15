@@ -1,5 +1,7 @@
 # Trakt list sync
 
+The hourly list-sync schedule was retired on October 15, 2026 because Trakt list collaborators replace it. Only the daily watch-history job remains scheduled. List-sync code and stored state are retained. The protected disable operation could not be completed because 1Password authorization timed out; the hourly Cloudflare trigger was removed and verified.
+
 Hourly bidirectional sync of David and Emalie’s private **DavEmalie** lists, plus daily watch-history date checks and automatic repairs. Both jobs run on Cloudflare Workers and share encrypted OAuth credentials, sync state, and repair journals in the existing Durable Object.
 
 This is the canonical project, consolidating the original `trakt-list-sync` and `trakt-scrobble-check` code. Future fixes and deployments belong here.
@@ -32,7 +34,7 @@ The Worker is `trakt-list-sync` in the Personal Cloudflare account:
 
 `https://trakt-list-sync.dgitman-personal.workers.dev`
 
-Set `SYNC_URL` to that URL for administration. The hourly list sync runs at minute 17; the daily history job runs at 12:35 UTC. Email is sent from `trakt-sync@gitman.net` to `david@because.ventures`.
+Set `SYNC_URL` to that URL for administration. The daily history job runs at 12:35 UTC; the hourly list-sync trigger has been removed. Email is sent from `trakt-sync@gitman.net` to `david@because.ventures`.
 
 The existing Worker was renamed in place on October 5, 2026. Its secrets, Durable Object namespace, stored grants, baseline, repair journals, and both cron triggers were preserved. Retain the `DavEmalieSync` class, stable `davemalie` object name, encryption key, and migration configuration for future deployments. These names identify existing state and are independent of the project name.
 
